@@ -643,6 +643,10 @@ private:
     // and is_receiving = false.
     void StartReceiving(int port_id);
 
+    // Starts capturing on the specified port. This can only be called when is_active = true and
+    // is_busy = false. Also kicks off a pending receiving process, if any.
+    void StartCapturePort(int port_id);
+
     // Cancels any ongoing receiving processes at the specified port. This is used by functions that
     // stop capturing.
     // TODO: what is the exact behaviour on real 3DS when stopping capture during an ongoing
@@ -697,6 +701,12 @@ private:
         // this will trigger a receiving process and reset itself.
         bool is_pending_receiving{false};
 
+        // set if StartCapture is called when is_active = false. When the port is activated by a
+        // later Activate call, capture starts immediately and this resets itself. Some games
+        // (e.g. Dragon Ball Heroes: Ultimate Mission, QR scanner) issue StartCapture before
+        // Activate, which works on real hardware.
+        bool is_pending_capture{false};
+
         // set when StartCapture is called and reset when StopCapture is called.
         bool is_busy{false};
 
@@ -729,6 +739,7 @@ private:
             ar & camera_id;
             ar & is_active;
             ar & is_pending_receiving;
+            ar & is_pending_capture;
             ar & is_busy;
             ar & is_receiving;
             ar & is_trimming;
