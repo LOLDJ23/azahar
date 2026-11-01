@@ -90,6 +90,7 @@ void Module::PortConfig::Clear() {
     is_receiving = false;
     is_active = false;
     is_pending_receiving = false;
+    is_pending_capture = false;
     is_busy = false;
     is_trimming = false;
     x0 = 0;
@@ -224,6 +225,25 @@ void Module::ActivatePort(int port_id, int camera_id) {
     system.CoreTiming().ScheduleEvent(
         msToCycles(LATENCY_BY_FRAME_RATE[static_cast<int>(cameras[camera_id].frame_rate)]),
         vsync_interrupt_event_callback, port_id);
+
+    if (ports[port_id].is_pending_capture) {
+        ports[port_id].is_pending_capture = false;
+        StartCapturePort(port_id);
+    }
+}
+
+void Module::StartCapturePort(int port_id) {
+    PortConfig& port = ports[port_id];
+    CameraConfig& camera = cameras[port.camera_id];
+    if (!camera.impl) {
+        LoadCameraImplementation(camera, port.camera_id);
+    }
+    camera.impl->StartCapture();
+    port.is_busy = true;
+    if (port.is_pending_receiving) {
+        port.is_pending_receiving = false;
+        StartReceiving(port_id);
+    }
 }
 
 template <int max_index>
@@ -267,21 +287,13 @@ void Module::Interface::StartCapture(Kernel::HLERequestContext& ctx) {
                 continue;
             }
             if (!port.is_active) {
-                // This doesn't return an error, but seems to put the camera in an undefined
-                // state
-                LOG_ERROR(Service_CAM, "port {} hasn't been activated", i);
+                // Real hardware doesn't return an error here. Remember the request and start
+                // capturing as soon as the port gets activated.
+                LOG_WARNING(Service_CAM, "port {} hasn't been activated, deferring capture", i);
+                port.is_pending_capture = true;
                 continue;
             }
-            auto& camera = cam->cameras[port.camera_id];
-            if (!camera.impl) {
-                cam->LoadCameraImplementation(camera, port.camera_id);
-            }
-            camera.impl->StartCapture();
-            port.is_busy = true;
-            if (port.is_pending_receiving) {
-                port.is_pending_receiving = false;
-                cam->StartReceiving(i);
-            }
+            cam->StartCapturePort(i);
         }
         rb.Push(ResultSuccess);
     } else {
@@ -304,6 +316,8 @@ void Module::Interface::StopCapture(Kernel::HLERequestContext& ctx) {
                 cam->CancelReceiving(i);
                 cam->cameras[cam->ports[i].camera_id].impl->StopCapture();
                 cam->ports[i].is_busy = false;
+            } else if (cam->ports[i].is_pending_capture) {
+                cam->ports[i].is_pending_capture = false;
             } else {
                 LOG_WARNING(Service_CAM, "port {} already stopped", i);
             }
@@ -687,6 +701,7 @@ void Module::Interface::Activate(Kernel::HLERequestContext& ctx) {
                     cam->ports[i].is_busy = false;
                 }
                 cam->ports[i].is_active = false;
+                cam->ports[i].is_pending_capture = false;
                 cam->system.CoreTiming().UnscheduleEvent(cam->vsync_interrupt_event_callback, i);
             }
             rb.Push(ResultSuccess);

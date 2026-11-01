@@ -14,8 +14,8 @@ if [[ "$TARGET" == "googleplay" ]]; then
     ./gradlew assembleGooglePlayRelease
     ./gradlew bundleGooglePlayRelease
 else
-    ./gradlew assembleVanillaRelease
-    ./gradlew bundleVanillaRelease
+    ./gradlew assembleVanillaRelWithDebInfo
+    ./gradlew bundleVanillaRelWithDebInfo
 fi
 
 ccache -s -v

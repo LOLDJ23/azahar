@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <mutex>
 #include <camera/NdkCameraCaptureSession.h>
 #include <camera/NdkCameraDevice.h>
@@ -333,6 +334,86 @@ struct YUVImage {
 #define YUV(image)                                                                                 \
     image.y.data(), image.width, image.u.data(), image.width / 2, image.v.data(), image.width / 2
 
+struct CropRect {
+    int x{};
+    int y{};
+    int width{};
+    int height{};
+};
+
+// Largest centered area of the device frame that has the aspect ratio of the requested output
+// image. This is the historical behaviour, used whenever the game captures the whole sensor.
+static CropRect OutputAspectCrop(int frame_width, int frame_height, int out_width, int out_height) {
+    CropRect crop;
+    if (out_width <= 0 || out_height <= 0) {
+        crop.width = frame_width;
+        crop.height = frame_height;
+        return crop;
+    }
+    if (out_width * frame_height > out_height * frame_width) {
+        crop.width = frame_width;
+        crop.height = frame_width * out_height / out_width;
+    } else {
+        crop.height = frame_height;
+        crop.width = frame_height * out_width / out_height;
+    }
+    crop.x = (frame_width - crop.width) / 2;
+    crop.y = (frame_height - crop.height) / 2;
+    return crop;
+}
+
+// Games can capture a sub-rectangle of the 640x480 sensor (CAM::SetDetailSize) which the hardware
+// then scales to the output size, e.g. to zoom in on a QR code. Emulate this by treating the
+// centered 4:3 area of the device frame as the sensor and cutting the requested rectangle out of
+// it. The crop coordinates are inclusive.
+static CropRect SensorCrop(int frame_width, int frame_height,
+                           const Service::CAM::Resolution& resolution) {
+    constexpr int SensorWidth = 640;
+    constexpr int SensorHeight = 480;
+
+    const int crop_x0 = resolution.crop_x0;
+    const int crop_y0 = resolution.crop_y0;
+    const int crop_x1 = resolution.crop_x1;
+    const int crop_y1 = resolution.crop_y1;
+
+    const bool is_full_sensor =
+        crop_x0 == 0 && crop_y0 == 0 && crop_x1 == SensorWidth - 1 && crop_y1 == SensorHeight - 1;
+    const bool is_valid =
+        crop_x0 < crop_x1 && crop_y0 < crop_y1 && crop_x1 < SensorWidth && crop_y1 < SensorHeight;
+    if (is_full_sensor || !is_valid) {
+        return OutputAspectCrop(frame_width, frame_height, resolution.width, resolution.height);
+    }
+
+    // Centered 4:3 area of the frame stands in for the sensor
+    int sensor_width{};
+    int sensor_height{};
+    if (frame_width * SensorHeight > frame_height * SensorWidth) {
+        sensor_height = frame_height;
+        sensor_width = frame_height * SensorWidth / SensorHeight;
+    } else {
+        sensor_width = frame_width;
+        sensor_height = frame_width * SensorHeight / SensorWidth;
+    }
+    const int sensor_x = (frame_width - sensor_width) / 2;
+    const int sensor_y = (frame_height - sensor_height) / 2;
+
+    CropRect crop;
+    crop.x = sensor_x + crop_x0 * sensor_width / SensorWidth;
+    crop.y = sensor_y + crop_y0 * sensor_height / SensorHeight;
+    crop.width = (crop_x1 - crop_x0 + 1) * sensor_width / SensorWidth;
+    crop.height = (crop_y1 - crop_y0 + 1) * sensor_height / SensorHeight;
+
+    // I420 chroma planes are subsampled 2x2: keep the rectangle on even coordinates and in bounds
+    crop.x &= ~1;
+    crop.y &= ~1;
+    crop.width = std::min(crop.width, frame_width - crop.x) & ~1;
+    crop.height = std::min(crop.height, frame_height - crop.y) & ~1;
+    if (crop.width < 2 || crop.height < 2) {
+        return OutputAspectCrop(frame_width, frame_height, resolution.width, resolution.height);
+    }
+    return crop;
+}
+
 std::vector<u16> Interface::ReceiveFrame() {
     bool should_reload = false;
     {
@@ -386,24 +467,15 @@ std::vector<u16> Interface::ReceiveFrame() {
                        static_cast<libyuv::RotationMode>(rotation));
     converted.Clear();
 
-    // Calculate crop coordinates
-    int crop_width{}, crop_height{};
-    if (resolution.width * height > resolution.height * width) {
-        crop_width = width;
-        crop_height = width * resolution.height / resolution.width;
-    } else {
-        crop_height = height;
-        crop_width = height * resolution.width / resolution.height;
-    }
-    const int crop_x = (width - crop_width) / 2;
-    const int crop_y = (height - crop_height) / 2;
+    // Calculate crop coordinates (honours the sensor region requested by the game, if any)
+    const CropRect crop = SensorCrop(width, height, resolution);
 
-    const int y_offset = crop_y * width + crop_x;
-    const int uv_offset = crop_y / 2 * width / 2 + crop_x / 2;
+    const int y_offset = crop.y * width + crop.x;
+    const int uv_offset = crop.y / 2 * width / 2 + crop.x / 2;
     YUVImage scaled(resolution.width, resolution.height);
     // Crop and scale
     libyuv::I420Scale(rotated.y.data() + y_offset, width, rotated.u.data() + uv_offset, width / 2,
-                      rotated.v.data() + uv_offset, width / 2, crop_width, crop_height, YUV(scaled),
+                      rotated.v.data() + uv_offset, width / 2, crop.width, crop.height, YUV(scaled),
                       resolution.width, resolution.height, libyuv::kFilterBilinear);
     rotated.Clear();
 
